@@ -334,6 +334,32 @@ TOOLS = [
         },
     ),
     Tool(
+        name="yd_ads_update_combinatorial",
+        description="Update a COMBINATORIAL (ResponsiveAd) ad by ID — change headlines/texts/href/images. Only pass fields you want changed; titles/texts, if given, REPLACE the whole array (1-7 titles, 1-3 texts).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "integer", "description": "Ad ID to update"},
+                            "titles": {"type": "array", "items": {"type": "string"}, "description": "New full array of 1-7 headlines (replaces existing), max 56 chars each"},
+                            "texts": {"type": "array", "items": {"type": "string"}, "description": "New full array of 1-3 texts (replaces existing), max 81 chars each"},
+                            "href": {"type": "string", "description": "New landing page URL"},
+                            "ad_image_hashes": {"type": "array", "items": {"type": "string"}, "description": "New 1-5 image hashes"},
+                            "sitelink_set_id": {"type": "integer", "description": "Sitelink set ID"},
+                            "display_url_path": {"type": "string", "description": "Display URL path, max 20 chars"},
+                        },
+                        "required": ["id"],
+                    },
+                },
+            },
+            "required": ["ads"],
+        },
+    ),
+    Tool(
         name="yd_ads_get",
         description="Get ads by campaign, ad group, or ad IDs.",
         inputSchema={
@@ -347,12 +373,12 @@ TOOLS = [
     ),
     Tool(
         name="yd_ads_action",
-        description="Moderate, suspend, resume, archive, or unarchive ads.",
+        description="Moderate, suspend, resume, archive, unarchive, or DELETE ads by ID. Works for ALL ad types including combinatorial (ResponsiveAd).",
         inputSchema={
             "type": "object",
             "properties": {
                 "ad_ids": {"type": "array", "items": {"type": "integer"}},
-                "action": {"type": "string", "enum": ["moderate", "suspend", "resume", "archive", "unarchive"]},
+                "action": {"type": "string", "enum": ["moderate", "suspend", "resume", "archive", "unarchive", "delete"]},
             },
             "required": ["ad_ids", "action"],
         },
@@ -1034,7 +1060,7 @@ _ESSENTIAL = {
     "yd_negative_keywords_sets_get",
     # Direct write
     "yd_campaigns_add","yd_campaigns_update","yd_campaigns_action",
-    "yd_adgroups_add","yd_ads_add","yd_ads_add_combinatorial","yd_ads_update","yd_ads_action",
+    "yd_adgroups_add","yd_ads_add","yd_ads_add_combinatorial","yd_ads_update","yd_ads_update_combinatorial","yd_ads_action",
     "yd_keywords_add","yd_bids_set","yd_keyword_bids_set","yd_keyword_bids_set_auto",
     "yd_bid_modifiers_add","yd_bid_modifiers_set","yd_bid_modifiers_delete",
     "yd_negative_keywords_sets_add","yd_negative_keywords_sets_update",
@@ -1146,6 +1172,8 @@ async def _dispatch(name: str, arguments: dict):
                 return await _handle_ads_add_combinatorial(client, arguments)
             elif name == "yd_ads_update":
                 return await _handle_ads_update(client, arguments)
+            elif name == "yd_ads_update_combinatorial":
+                return await _handle_ads_update_combinatorial(client, arguments)
             elif name == "yd_ads_get":
                 return await _handle_ads_get(client, arguments)
             elif name == "yd_ads_action":
@@ -1490,6 +1518,27 @@ async def _handle_ads_update(client, args):
         if img_hash := a.get("ad_image_hash"):
             ad["TextAd"]["AdImageHash"] = img_hash
         ads.append(ad)
+    data = await _api(client, "ads", "update", {"Ads": ads})
+    return _result(data.get("result", data))
+
+
+async def _handle_ads_update_combinatorial(client, args):
+    ads = []
+    for a in args["ads"]:
+        resp = {}
+        if titles := a.get("titles"):
+            resp["Titles"] = titles
+        if texts := a.get("texts"):
+            resp["Texts"] = texts
+        if href := a.get("href"):
+            resp["Href"] = href
+        if hashes := a.get("ad_image_hashes"):
+            resp["AdImageHashes"] = hashes
+        if sitelink_id := a.get("sitelink_set_id"):
+            resp["SitelinkSetId"] = sitelink_id
+        if dup := a.get("display_url_path"):
+            resp["DisplayUrlPath"] = dup
+        ads.append({"Id": a["id"], "ResponsiveAd": resp})
     data = await _api(client, "ads", "update", {"Ads": ads})
     return _result(data.get("result", data))
 
