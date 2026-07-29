@@ -281,6 +281,33 @@ TOOLS = [
         },
     ),
     Tool(
+        name="yd_ads_add_combinatorial",
+        description="Create COMBINATORIAL (комбинаторные) text-graphic ads — the modern Yandex Direct format with MULTIPLE headlines and texts that the system auto-combines into many banners. Use THIS (not yd_ads_add) when you have several title/text variants. Builds a ResponsiveAd. Limits: 1-7 titles (max 56 chars each), 1-3 texts (max 81 chars each), up to 5 images, up to 3 combinatorial ads per ad group. Needs href OR business_id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ad_group_id": {"type": "integer"},
+                            "titles": {"type": "array", "items": {"type": "string"}, "description": "1-7 headlines, each max 56 chars"},
+                            "texts": {"type": "array", "items": {"type": "string"}, "description": "1-3 texts, each max 81 chars"},
+                            "href": {"type": "string", "description": "Landing page URL (required unless business_id)"},
+                            "business_id": {"type": "integer", "description": "Organization profile ID (alternative to href)"},
+                            "ad_image_hashes": {"type": "array", "items": {"type": "string"}, "description": "1-5 image hashes (from yd_ad_images_add)"},
+                            "sitelink_set_id": {"type": "integer", "description": "Sitelink set ID (with href only)"},
+                            "display_url_path": {"type": "string", "description": "Display URL path, max 20 chars (with href only)"},
+                        },
+                        "required": ["ad_group_id", "titles", "texts"],
+                    },
+                },
+            },
+            "required": ["ads"],
+        },
+    ),
+    Tool(
         name="yd_ads_update",
         description="Update existing text ads. Can change title, text, href, sitelinks, image, etc.",
         inputSchema={
@@ -1007,7 +1034,7 @@ _ESSENTIAL = {
     "yd_negative_keywords_sets_get",
     # Direct write
     "yd_campaigns_add","yd_campaigns_update","yd_campaigns_action",
-    "yd_adgroups_add","yd_ads_add","yd_ads_update","yd_ads_action",
+    "yd_adgroups_add","yd_ads_add","yd_ads_add_combinatorial","yd_ads_update","yd_ads_action",
     "yd_keywords_add","yd_bids_set","yd_keyword_bids_set","yd_keyword_bids_set_auto",
     "yd_bid_modifiers_add","yd_bid_modifiers_set","yd_bid_modifiers_delete",
     "yd_negative_keywords_sets_add","yd_negative_keywords_sets_update",
@@ -1115,6 +1142,8 @@ async def _dispatch(name: str, arguments: dict):
                 return await _handle_adgroups_get(client, arguments)
             elif name == "yd_ads_add":
                 return await _handle_ads_add(client, arguments)
+            elif name == "yd_ads_add_combinatorial":
+                return await _handle_ads_add_combinatorial(client, arguments)
             elif name == "yd_ads_update":
                 return await _handle_ads_update(client, arguments)
             elif name == "yd_ads_get":
@@ -1425,6 +1454,25 @@ async def _handle_ads_add(client, args):
     return _result(data.get("result", data))
 
 
+async def _handle_ads_add_combinatorial(client, args):
+    ads = []
+    for a in args["ads"]:
+        resp = {"Titles": a["titles"], "Texts": a["texts"]}
+        if href := a.get("href"):
+            resp["Href"] = href
+        if business_id := a.get("business_id"):
+            resp["BusinessId"] = business_id
+        if hashes := a.get("ad_image_hashes"):
+            resp["AdImageHashes"] = hashes
+        if sitelink_id := a.get("sitelink_set_id"):
+            resp["SitelinkSetId"] = sitelink_id
+        if dup := a.get("display_url_path"):
+            resp["DisplayUrlPath"] = dup
+        ads.append({"AdGroupId": a["ad_group_id"], "ResponsiveAd": resp})
+    data = await _api(client, "ads", "add", {"Ads": ads})
+    return _result(data.get("result", data))
+
+
 async def _handle_ads_update(client, args):
     ads = []
     for a in args["ads"]:
@@ -1458,6 +1506,7 @@ async def _handle_ads_get(client, args):
         "SelectionCriteria": criteria,
         "FieldNames": ["Id", "AdGroupId", "CampaignId", "Status", "State", "Type"],
         "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "Mobile"],
+        "ResponsiveAdFieldNames": ["Titles", "Texts", "Href"],
     }
     data = await _api(client, "ads", "get", params)
     return _result(data.get("result", data))
