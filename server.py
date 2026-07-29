@@ -998,11 +998,32 @@ def _augment_schema(tool: Tool) -> Tool:
     return Tool(name=tool.name, description=tool.description, inputSchema=schema)
 
 
+_ESSENTIAL = {
+    # Direct read
+    "yd_campaigns_get","yd_adgroups_get","yd_ads_get","yd_keywords_get",
+    "yd_keyword_bids_get","yd_bid_modifiers_get","yd_report","yd_dictionaries",
+    "yd_changes_check","yd_clients_get","yd_keywords_has_volume",
+    "yd_negative_keywords_sets_get",
+    # Direct write
+    "yd_campaigns_add","yd_campaigns_update","yd_campaigns_action",
+    "yd_adgroups_add","yd_ads_add","yd_ads_update","yd_ads_action",
+    "yd_keywords_add","yd_bids_set","yd_keyword_bids_set","yd_keyword_bids_set_auto",
+    "yd_bid_modifiers_add","yd_bid_modifiers_set","yd_bid_modifiers_delete",
+    "yd_negative_keywords_sets_add","yd_negative_keywords_sets_update",
+    "yd_campaign_strategy_update","yd_excluded_sites_update","yd_excluded_sites_get",
+    # Metrika
+    "yd_metrika_counters_get","yd_metrika_goals_get","yd_metrika_report",
+    "yd_metrika_report_comparison","yd_metrika_report_by_time",
+    "yd_wordstat_top_requests",
+}
+
 @server.list_tools()
 async def list_tools():
     _all = TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS
     if READONLY:
         _all = [t for t in _all if not _is_mutating(t.name)]
+    if _env_bool("YD_LEAN"):
+        _all = [t for t in _all if t.name in _ESSENTIAL]
     return [_augment_schema(t) for t in _all]
 
 
