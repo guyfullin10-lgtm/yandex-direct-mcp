@@ -26,6 +26,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 API_URL = os.environ.get("YD_API_URL", "https://api.direct.yandex.com/json/v5")
 SANDBOX_URL = "https://api-sandbox.direct.yandex.com/json/v5"
+API_URL_V501 = os.environ.get("YD_API_URL_V501", "https://api.direct.yandex.com/json/v501")
+SANDBOX_URL_V501 = "https://api-sandbox.direct.yandex.com/json/v501"
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat"
 TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
 YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
@@ -84,6 +86,10 @@ def _base_url():
     return SANDBOX_URL if USE_SANDBOX else API_URL
 
 
+def _base_url_v501():
+    return SANDBOX_URL_V501 if USE_SANDBOX else API_URL_V501
+
+
 def _effective_login() -> str:
     """Per-call Client-Login (multi-account) overrides the global default."""
     return client_login_var.get("") or LOGIN
@@ -101,9 +107,10 @@ def _headers():
     return h
 
 
-async def _api(client: httpx.AsyncClient, service: str, method: str, params: dict) -> dict:
+async def _api(client: httpx.AsyncClient, service: str, method: str, params: dict, version: str = "v5") -> dict:
     """Call Yandex Direct API v5."""
-    url = f"{_base_url()}/{service}"
+    base = _base_url() if version == "v5" else _base_url_v501()
+    url = f"{base}/{service}"
     body = {"method": method, "params": params}
     _log_body("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await request_with_retry(client, url, headers=_headers(), json_body=body, timeout=120)
@@ -1497,7 +1504,7 @@ async def _handle_ads_add_combinatorial(client, args):
         if dup := a.get("display_url_path"):
             resp["DisplayUrlPath"] = dup
         ads.append({"AdGroupId": a["ad_group_id"], "ResponsiveAd": resp})
-    data = await _api(client, "ads", "add", {"Ads": ads})
+    data = await _api(client, "ads", "add", {"Ads": ads}, version="v501")
     return _result(data.get("result", data))
 
 
@@ -1539,7 +1546,7 @@ async def _handle_ads_update_combinatorial(client, args):
         if dup := a.get("display_url_path"):
             resp["DisplayUrlPath"] = dup
         ads.append({"Id": a["id"], "ResponsiveAd": resp})
-    data = await _api(client, "ads", "update", {"Ads": ads})
+    data = await _api(client, "ads", "update", {"Ads": ads}, version="v501")
     return _result(data.get("result", data))
 
 
@@ -1557,7 +1564,7 @@ async def _handle_ads_get(client, args):
         "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "Mobile"],
         "ResponsiveAdFieldNames": ["Titles", "Texts", "Href"],
     }
-    data = await _api(client, "ads", "get", params)
+    data = await _api(client, "ads", "get", params, version="v501")
     return _result(data.get("result", data))
 
 
