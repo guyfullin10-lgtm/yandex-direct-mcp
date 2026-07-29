@@ -930,12 +930,12 @@ TOOLS = [
     # ── Wordstat API ───────────────────────────────────────────────────
     Tool(
         name="yd_wordstat_top_requests",
-        description="Get popular search queries containing a keyword from Yandex Wordstat (last 30 days). Returns phrases with search counts. 1 quota unit per request.",
+        description="Get popular search queries containing a keyword from Yandex Wordstat (last 30 days). Returns up to 2000 related phrases with search counts in ONE request. Wordstat has NO batch endpoint (one seed phrase per request) and a hard quota of 100 requests/HOUR; each request costs 1 unit no matter how many phrases it returns. So keep num_phrases=2000 (the default) and cover each seed in a single call — never make one request per keyword.",
         inputSchema={
             "type": "object",
             "properties": {
                 "phrase": {"type": "string", "description": "Keyword to analyze"},
-                "num_phrases": {"type": "integer", "description": "How many related phrases to return, 1-2000 (default 30)"},
+                "num_phrases": {"type": "integer", "description": "Related phrases to return, 1-2000. DEFAULT 2000 (max). Quota is only 100 requests/HOUR and cost is per-request regardless of count — ALWAYS keep this at the max; only lower it if you specifically need a short list."},
                 "regions": {"type": "array", "items": {"type": "integer"}, "description": "Region IDs (optional, omit for all Russia)"},
                 "devices": {"type": "string", "enum": ["all", "desktop", "phone", "tablet"], "description": "Device filter (default: all)"},
             },
@@ -1993,7 +1993,7 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
 
 async def _handle_wordstat_top_requests(client, args):
     # The Wordstat /topRequests endpoint requires numPhrases (1..2000).
-    num = int(args.get("num_phrases", 30))
+    num = int(args.get("num_phrases", 2000))
     num = max(1, min(num, 2000))
     body = {"phrase": args["phrase"], "numPhrases": num}
     if regions := args.get("regions"):
