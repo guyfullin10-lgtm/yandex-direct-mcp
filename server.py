@@ -1017,6 +1017,34 @@ _ESSENTIAL = {
     "yd_wordstat_top_requests",
 }
 
+def _platform_tag(old_name):
+    if old_name.startswith("yd_metrika"):
+        return "Yandex Metrika / \u042f\u043d\u0434\u0435\u043a\u0441 \u041c\u0435\u0442\u0440\u0438\u043a\u0430 (web analytics). "
+    if old_name.startswith("yd_wordstat"):
+        return "Yandex Wordstat / \u042f\u043d\u0434\u0435\u043a\u0441 \u0412\u043e\u0440\u0434\u0441\u0442\u0430\u0442 (keyword research). "
+    return "Yandex Direct / \u042f\u043d\u0434\u0435\u043a\u0441 \u0414\u0438\u0440\u0435\u043a\u0442 (search/context ads). "
+
+
+def _rename(old):
+    if old.startswith("yd_metrika_"):
+        return "yandex_metrika_" + old[len("yd_metrika_"):]
+    if old.startswith("yd_wordstat_"):
+        return "yandex_wordstat_" + old[len("yd_wordstat_"):]
+    if old.startswith("yd_"):
+        return "yandex_direct_" + old[len("yd_"):]
+    return old
+
+
+def _unrename(new):
+    if new.startswith("yandex_metrika_"):
+        return "yd_metrika_" + new[len("yandex_metrika_"):]
+    if new.startswith("yandex_wordstat_"):
+        return "yd_wordstat_" + new[len("yandex_wordstat_"):]
+    if new.startswith("yandex_direct_"):
+        return "yd_" + new[len("yandex_direct_"):]
+    return new
+
+
 @server.list_tools()
 async def list_tools():
     _all = TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS
@@ -1024,7 +1052,13 @@ async def list_tools():
         _all = [t for t in _all if not _is_mutating(t.name)]
     if _env_bool("YD_LEAN"):
         _all = [t for t in _all if t.name in _ESSENTIAL]
-    return [_augment_schema(t) for t in _all]
+    out = []
+    for t in _all:
+        at = _augment_schema(t)
+        out.append(Tool(name=_rename(at.name),
+                        description=_platform_tag(at.name) + at.description,
+                        inputSchema=at.inputSchema))
+    return out
 
 
 def _rubles_to_micros(rubles: float) -> int:
@@ -1036,6 +1070,7 @@ def _rubles_to_micros(rubles: float) -> int:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    name = _unrename(name)
     arguments = dict(arguments or {})
     # Cross-cutting controls (not forwarded to the Yandex API)
     req_login = arguments.pop("client_login", None)
