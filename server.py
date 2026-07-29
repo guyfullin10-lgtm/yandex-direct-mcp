@@ -29,6 +29,7 @@ SANDBOX_URL = "https://api-sandbox.direct.yandex.com/json/v5"
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat"
 TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
 YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
+YC_SA_KEY_FILE = os.environ.get("YC_SA_KEY_FILE", "")
 USE_SANDBOX = _env_bool("YD_SANDBOX")
 LOGIN = os.environ.get("YD_LOGIN", "")  # optional default Client-Login for agency accounts
 
@@ -1939,9 +1940,25 @@ async def _get_iam_token(client: httpx.AsyncClient) -> str:
     now = time.time()
     if _iam_token_cache["token"] and _iam_token_cache["expires"] > now + 300:
         return _iam_token_cache["token"]
+    if YC_SA_KEY_FILE:
+        import jwt as _jwt, time as _time
+        with open(YC_SA_KEY_FILE, encoding="utf-8") as _f:
+            _k = json.load(_f)
+        _n = int(now)
+        _payload = {
+            "aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+            "iss": _k["service_account_id"],
+            "iat": _n,
+            "exp": _n + 360,
+        }
+        _signed = _jwt.encode(_payload, _k["private_key"], algorithm="PS256",
+                              headers={"kid": _k["id"]})
+        _reqbody = {"jwt": _signed}
+    else:
+        _reqbody = {"yandexPassportOauthToken": TOKEN}
     resp = await client.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"yandexPassportOauthToken": TOKEN},
+        json=_reqbody,
         timeout=30,
     )
     data = resp.json()
