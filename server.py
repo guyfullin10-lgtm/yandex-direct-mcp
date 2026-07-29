@@ -1000,7 +1000,10 @@ def _augment_schema(tool: Tool) -> Tool:
 
 @server.list_tools()
 async def list_tools():
-    return [_augment_schema(t) for t in (TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS)]
+    _all = TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS
+    if READONLY:
+        _all = [t for t in _all if not _is_mutating(t.name)]
+    return [_augment_schema(t) for t in _all]
 
 
 def _rubles_to_micros(rubles: float) -> int:
