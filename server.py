@@ -1980,10 +1980,10 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
         "Content-Type": "application/json",
     }
     _log_body("WORDSTAT REQUEST %s: %s", url, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=60)
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=60, max_attempts=6)
     _log_body("WORDSTAT RESPONSE %s: %s", resp.status_code, resp.text[:2000])
     if resp.status_code == 429:
-        raise Exception(f"Wordstat rate limit exceeded (429). Retry later.")
+        raise Exception("Wordstat rate limit exceeded (429) after retries. Slow the pace or raise the Yandex Cloud folder quota (Search API).")
     if resp.status_code == 503:
         raise Exception(f"Wordstat global quota exceeded (503).")
     if resp.status_code != 200:
