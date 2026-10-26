@@ -1,5 +1,6 @@
 """Extra Yandex Direct API tools: VCards, Feeds, Smart targets, Ad types, Videos, Creatives, misc."""
 
+import os
 import re
 import json
 import time
@@ -10,6 +11,8 @@ import datetime
 import contextvars
 
 from mcp.types import Tool, TextContent
+
+import image_formats
 
 logger = logging.getLogger("yandex-ads-mcp")
 
@@ -187,9 +190,22 @@ async def _get_iam(client, oauth_token):
     now = time.time()
     if _iam_cache["token"] and _iam_cache["expires"] > now + 300:
         return _iam_cache["token"]
+    _sa_key_file = os.environ.get("YC_SA_KEY_FILE", "")
+    if _sa_key_file:
+        import jwt as _jwt
+        with open(_sa_key_file, encoding="utf-8") as _f:
+            _k = json.load(_f)
+        _n = int(now)
+        _signed = _jwt.encode(
+            {"aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+             "iss": _k["service_account_id"], "iat": _n, "exp": _n + 360},
+            _k["private_key"], algorithm="PS256", headers={"kid": _k["id"]})
+        _reqbody = {"jwt": _signed}
+    else:
+        _reqbody = {"yandexPassportOauthToken": oauth_token}
     resp = await client.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"yandexPassportOauthToken": oauth_token}, timeout=30,
+        json=_reqbody, timeout=30,
     )
     data = resp.json()
     if "iamToken" not in data:
@@ -360,6 +376,7 @@ EXTRA_DIRECT_TOOLS = [
                 "adgroup_id": {"type": "integer", "description": "Ad group ID"},
                 "ad_image_hash": {"type": "string", "description": "Image hash"},
                 "href": {"type": "string", "description": "Landing page URL"},
+                "force": {"type": "boolean", "description": "Skip the image Type pre-check"},
             },
             "required": ["adgroup_id", "ad_image_hash", "href"],
         },
@@ -431,7 +448,7 @@ EXTRA_DIRECT_TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "ad_id": {"type": "integer", "description": "Ad ID"},
+                "ad_id": {"type": ["integer", "string"], "description": "Ad ID. Pass a 19-digit combinatorial ad ID as a STRING."},
                 "callout_ids": {"type": "array", "items": {"type": "integer"}, "description": "Callout extension IDs"},
             },
             "required": ["ad_id", "callout_ids"],
@@ -518,7 +535,11 @@ async def _handle_vcards_get(client, args, config):
     if ids := args.get("vcard_ids"):
         criteria["Ids"] = ids
     fields = ["Id", "CampaignId", "Country", "City", "Street", "House", "CompanyName", "Phone", "WorkTime", "ExtraMessage"]
-    data = await _api(client, "vcards", "get", {"SelectionCriteria": criteria, "FieldNames": fields}, **c)
+    # обход 06.09.2026: пустой SelectionCriteria -> 8000; без него сервис отдаёт всё
+    params = {"FieldNames": fields}
+    if criteria:
+        params["SelectionCriteria"] = criteria
+    data = await _api(client, "vcards", "get", params, **c)
     return _result(data.get("result", data))
 
 
@@ -549,8 +570,15 @@ async def _handle_feeds_get(client, args, config):
     criteria = {}
     if ids := args.get("feed_ids"):
         criteria["Ids"] = ids
-    fields = ["Id", "Name", "BusinessType", "SourceType", "UrlFeed", "Status", "NumberOfItems"]
-    data = await _api(client, "feeds", "get", {"SelectionCriteria": criteria, "FieldNames": fields}, **c)
+    # обход 06.09.2026: UrlFeed у feeds.get нет, был 8000
+    fields = ["Id", "Name", "BusinessType", "SourceType", "FilterSchema", "UpdatedAt",
+              "CampaignIds", "NumberOfItems", "NumberOfListings", "Status",
+              "TitleAndTextSources", "Fields"]
+    # обход 06.09.2026: пустой SelectionCriteria -> 8000; без него сервис отдаёт всё
+    params = {"FieldNames": fields}
+    if criteria:
+        params["SelectionCriteria"] = criteria
+    data = await _api(client, "feeds", "get", params, **c)
     return _result(data.get("result", data))
 
 
@@ -600,7 +628,10 @@ async def _handle_smart_targets_get(client, args, config):
         criteria["AdGroupIds"] = ids
     if ids := args.get("target_ids"):
         criteria["Ids"] = ids
-    fields = ["Id", "AdGroupId", "CampaignId", "Name", "AvailableItemsOnly", "Conditions", "State", "StatusClarification"]
+    # обход 06.09.2026: StatusClarification у smartadtargets.get нет, был 8000
+    fields = ["Id", "AdGroupId", "CampaignId", "Name", "AverageCpc", "AverageCpa",
+              "StrategyPriority", "Conditions", "ConditionType", "State", "Audience",
+              "AvailableItemsOnly"]
     data = await _api(client, "smartadtargets", "get", {"SelectionCriteria": criteria, "FieldNames": fields}, **c)
     return _result(data.get("result", data))
 
@@ -628,9 +659,38 @@ async def _handle_ads_add_dynamic(client, args, config):
 
 async def _handle_ads_add_image(client, args, config):
     c = _cfg(config)
+    img_hash = args["ad_image_hash"]
+
+    # Графическое объявление собирается только из FIXED_IMAGE. Без этой проверки
+    # ads.add падает кодом, из которого не видно, что дело в размере картинки.
+    # Если сам запрос к API не удался — пропускаем вперёд, решать должен Директ.
+    if not args.get("force"):
+        found = None
+        try:
+            info = await _api(client, "adimages", "get", {
+                "SelectionCriteria": {"AdImageHashes": [img_hash]},
+                "FieldNames": ["AdImageHash", "Name", "Type"],
+            }, **c)
+            found = (info.get("result") or {}).get("AdImages") or []
+        except Exception as exc:
+            logger.warning("adimages.get preflight failed: %s", exc)
+        if found is not None:
+            if not found:
+                return _result({
+                    "error": "Image hash {} not found in the account library".format(img_hash),
+                })
+            img_type = found[0].get("Type")
+            if img_type != "FIXED_IMAGE":
+                return _result({
+                    "error": "Image {} has Type={}; an image ad requires FIXED_IMAGE".format(
+                        img_hash, img_type),
+                    "Image": found[0],
+                    "Hint": image_formats.HINT,
+                })
+
     ad = {
         "AdGroupId": args["adgroup_id"],
-        "TextImageAd": {"AdImageHash": args["ad_image_hash"], "Href": args["href"]},
+        "TextImageAd": {"AdImageHash": img_hash, "Href": args["href"]},
     }
     data = await _api(client, "ads", "add", {"Ads": [ad]}, **c)
     return _result(data.get("result", data))
@@ -669,6 +729,10 @@ async def _handle_videos_get(client, args, config):
     if ids := args.get("video_ids"):
         criteria["Ids"] = ids
     fields = ["Id", "Name", "Status", "Duration", "PreviewUrl"]
+    if not criteria:
+        # обход 06.09.2026: advideos.get без Ids не работает в принципе — это ограничение API
+        return _result({"error": "advideos.get работает только по конкретным ID: укажи video_ids. "
+                                 "Списком все видео аккаунта API не отдаёт."})
     data = await _api(client, "advideos", "get", {"SelectionCriteria": criteria, "FieldNames": fields}, **c)
     return _result(data.get("result", data))
 
@@ -687,7 +751,9 @@ async def _handle_creatives_get(client, args, config):
         criteria["Ids"] = ids
     if types := args.get("types"):
         criteria["Types"] = types
-    fields = ["Id", "Type", "Name", "PreviewUrl", "VideoExtensionCreative"]
+    # обход 06.09.2026: VideoExtensionCreative у creatives.get нет, был 8000
+    fields = ["Id", "Type", "Name", "PreviewUrl", "Width", "Height",
+              "ThumbnailUrl", "Associated", "IsAdaptive"]
     data = await _api(client, "creatives", "get", {"SelectionCriteria": criteria, "FieldNames": fields}, **c)
     return _result(data.get("result", data))
 
@@ -697,7 +763,8 @@ async def _handle_creatives_get(client, args, config):
 async def _handle_callouts_link(client, args, config):
     c = _cfg(config)
     extensions = [{"AdExtensionId": cid, "Operation": "SET"} for cid in args["callout_ids"]]
-    ad = {"Id": args["ad_id"], "TextAd": {"CalloutSetting": {"AdExtensions": extensions}}}
+    kind = args.get("ad_kind") or "ResponsiveAd"
+    ad = {"Id": int(str(args["ad_id"]).strip()), kind: {"CalloutSetting": {"AdExtensions": extensions}}}
     data = await _api501(client, "ads", "update", {"Ads": [ad]}, **c)
     return _result(data.get("result", data))
 
@@ -788,8 +855,9 @@ async def _handle_excluded_sites_get(client, args, config):
         "SelectionCriteria": {"Ids": [args["campaign_id"]]},
         "FieldNames": ["Id", "Name", "ExcludedSites"],
     }, **config)
-    camps = data.get("result", {}).get("Campaigns", [])
+    camps = (data.get("result") or {}).get("Campaigns") or []
     if camps:
+        # обход 06.09.2026: у кампании без исключённых площадок приходит null, а не {}
         sites = (camps[0].get("ExcludedSites") or {}).get("Items") or []
         return _result({"campaign_id": args["campaign_id"], "excluded_sites": sites, "count": len(sites)})
     return _result({"error": "Campaign not found"})
@@ -1116,3 +1184,24 @@ def register_extra_direct_handlers(dispatch: dict):
 
 # Append new tools to the main list
 EXTRA_DIRECT_TOOLS.extend(_NEW_TOOLS)
+
+
+# Tools kept for backward compatibility but no longer advertised (dead upstream API methods).
+_PHANTOM_TOOLS = {"yd_wordstat_user_info"}
+EXTRA_DIRECT_TOOLS = [_t for _t in EXTRA_DIRECT_TOOLS if _t.name not in _PHANTOM_TOOLS]
+
+
+# ── money tools (пакетные стратегии, бюджеты, деньги аккаунта) ──
+# Импорт стоит в самом конце файла: tools_money берёт отсюда _api/_cfg/_result,
+# а EXTRA_DIRECT_TOOLS выше пересобирается фильтром _PHANTOM_TOOLS.
+from tools_money import MONEY_TOOLS as _MONEY_TOOLS, register_money_handlers as _register_money
+
+EXTRA_DIRECT_TOOLS = EXTRA_DIRECT_TOOLS + _MONEY_TOOLS
+
+_register_extra_direct_handlers_base = register_extra_direct_handlers
+
+
+def register_extra_direct_handlers(dispatch: dict):  # noqa: F811
+    """Базовые extra-хендлеры + денежные."""
+    _register_extra_direct_handlers_base(dispatch)
+    _register_money(dispatch)

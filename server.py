@@ -9,12 +9,16 @@ import os
 import sys
 import json
 import asyncio
+import time
+import datetime
 import logging
 
 import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
+
+import image_formats
 
 # ── Config ─────────────────────────────────────────────────────────────
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -26,6 +30,8 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 API_URL = os.environ.get("YD_API_URL", "https://api.direct.yandex.com/json/v5")
 SANDBOX_URL = "https://api-sandbox.direct.yandex.com/json/v5"
+API_URL_V501 = os.environ.get("YD_API_URL_V501", "https://api.direct.yandex.com/json/v501")
+SANDBOX_URL_V501 = "https://api-sandbox.direct.yandex.com/json/v501"
 WORDSTAT_URL = "https://searchapi.api.cloud.yandex.net/v2/wordstat"
 TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
 # Optional per-service tokens for multi-account setups (e.g. Direct lives in one
@@ -33,6 +39,7 @@ TOKEN = os.environ.get("YD_OAUTH_TOKEN", "")
 METRIKA_TOKEN = os.environ.get("YD_METRIKA_TOKEN", "") or TOKEN
 AUDIENCE_TOKEN = os.environ.get("YD_AUDIENCE_TOKEN", "") or TOKEN
 YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
+YC_SA_KEY_FILE = os.environ.get("YC_SA_KEY_FILE", "")
 # Service-account API key for Wordstat (Search API). Required for OAuth tokens
 # issued after 2026-06-01: Yandex Cloud no longer exchanges them for IAM tokens.
 YC_API_KEY = os.environ.get("YC_API_KEY", "")
@@ -111,6 +118,10 @@ def _base_url():
     return SANDBOX_URL if USE_SANDBOX else API_URL
 
 
+def _base_url_v501():
+    return SANDBOX_URL_V501 if USE_SANDBOX else API_URL_V501
+
+
 def _effective_login() -> str:
     """Per-call Client-Login (multi-account) overrides the global default."""
     return client_login_var.get("") or LOGIN
@@ -121,9 +132,10 @@ def _headers():
     return direct_headers(TOKEN, LOGIN)
 
 
-async def _api(client: httpx.AsyncClient, service: str, method: str, params: dict) -> dict:
+async def _api(client: httpx.AsyncClient, service: str, method: str, params: dict, version: str = "v5") -> dict:
     """Call Yandex Direct API v5."""
-    url = f"{_base_url()}/{service}"
+    base = _base_url() if version == "v5" else _base_url_v501()
+    url = f"{base}/{service}"
     body = {"method": method, "params": params}
     _log_body("REQUEST %s %s: %s", url, method, json.dumps(body, ensure_ascii=False)[:2000])
     resp = await request_with_retry(client, url, headers=_headers(), json_body=body, timeout=120)
@@ -137,14 +149,36 @@ async def _api(client: httpx.AsyncClient, service: str, method: str, params: dic
 
 # ── Access control ─────────────────────────────────────────────────────
 
-_MUTATING_TOKENS = ("_add", "_create", "_update", "_delete", "_action",
-                    "_set", "_toggle", "_link", "_unlink", "_upload",
-                    "_suspend", "_resume", "_confirm", "_reprocess", "_undelete")
+# обход 06.09.2026: сравнивать надо ЦЕЛЫЕ слова имени, а не подстроки. Подстрочная
+# проверка считала пишущим yd_negative_keywords_sets_get ("set" внутри "sets"),
+# из-за чего тул на чтение требовал confirm и пропадал в read-only режиме.
+# Список слов расширен словами апстрима (suspend/resume/confirm/reprocess/undelete).
+_MUTATING_WORDS = frozenset((
+    "add", "create", "update", "delete", "action", "set", "toggle", "link",
+    "unlink", "upload", "moderate", "archive", "unarchive", "suspend", "resume",
+    "confirm", "reprocess", "undelete",
+))
 
 
 def _is_mutating(name: str) -> bool:
     """True for any tool that changes state (create/update/delete/action/...)."""
-    return any(t in name for t in _MUTATING_TOKENS)
+    return bool(_MUTATING_WORDS & set(name.split("_")))
+
+
+def _as_ids(seq):
+    """Coerce a sequence of IDs to int, tolerating strings.
+
+    Combinatorial ad IDs are 19 digits and exceed 2**53, so any JSON client that
+    parses numbers as float64 corrupts them. Callers pass such IDs as strings;
+    this normalises both forms.
+    """
+    out = []
+    for v in seq:
+        s = str(v).strip()
+        if not s.lstrip("-").isdigit():
+            raise ValueError("not a numeric id: %r" % (v,))
+        out.append(int(s))
+    return out
 
 
 _AUDIENCE_NAMES = frozenset(t.name for t in AUDIENCE_TOOLS)
@@ -190,6 +224,7 @@ TOOLS = [
                 "types": {"type": "array", "items": {"type": "string"}, "description": "TEXT_CAMPAIGN, UNIFIED_CAMPAIGN, etc."},
                 "states": {"type": "array", "items": {"type": "string"}, "description": "ON, OFF, SUSPENDED, ARCHIVED, etc."},
                 "ids": {"type": "array", "items": {"type": "integer"}, "description": "Campaign IDs"},
+                "include_unmanageable": {"type": "boolean", "description": "Доклеить кампании, которых API не отдаёт (Мастер кампаний), из отчёта за 30 дней с флагом ApiManageable=false и статистикой Clicks30d/Cost30d. По умолчанию true."},
             },
         },
     ),
@@ -228,6 +263,9 @@ TOOLS = [
                 "daily_budget_amount": {"type": "number", "description": "Daily budget in rubles"},
                 "daily_budget_mode": {"type": "string", "enum": ["STANDARD", "DISTRIBUTED"]},
                 "negative_keywords": {"type": "array", "items": {"type": "string"}},
+                "negative_keywords_mode": {"type": "string", "enum": ["replace", "append"],
+                                           "description": "replace (default) overwrites the campaign's negative "
+                                                          "keywords; append merges with the existing list"},
                 "end_date": {"type": "string", "description": "YYYY-MM-DD"},
             },
             "required": ["campaign_id"],
@@ -281,6 +319,28 @@ TOOLS = [
         },
     ),
     Tool(
+        name="yd_adgroups_delete",
+        description="DELETE ad groups by ID. Removes each group together with its keywords and ads - irreversible. Typical use: merging duplicate groups after their keywords were re-added elsewhere.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "group_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "Ad group IDs to delete"},
+            },
+            "required": ["group_ids"],
+        },
+    ),
+    Tool(
+        name="yd_keywords_delete",
+        description="DELETE keywords (and autotargeting entities) by ID - irreversible. Read the IDs from yd_keywords_get / yd_autotargeting_get first.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "keyword_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "Keyword IDs to delete"},
+            },
+            "required": ["keyword_ids"],
+        },
+    ),
+    Tool(
         name="yd_ads_add",
         description="Create text ads in ad groups. Supports bulk creation, sitelinks, and images.",
         inputSchema={
@@ -308,6 +368,33 @@ TOOLS = [
         },
     ),
     Tool(
+        name="yd_ads_add_combinatorial",
+        description="Create COMBINATORIAL (комбинаторные) text-graphic ads — the modern Yandex Direct format with MULTIPLE headlines and texts that the system auto-combines into many banners. Use THIS (not yd_ads_add) when you have several title/text variants. Builds a ResponsiveAd. Limits: 1-7 titles (max 56 chars each), 1-3 texts (max 81 chars each), up to 5 images, up to 3 combinatorial ads per ad group. Needs href OR business_id.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "ad_group_id": {"type": "integer"},
+                            "titles": {"type": "array", "items": {"type": "string"}, "description": "1-7 headlines, each max 56 chars"},
+                            "texts": {"type": "array", "items": {"type": "string"}, "description": "1-3 texts, each max 81 chars"},
+                            "href": {"type": "string", "description": "Landing page URL (required unless business_id)"},
+                            "business_id": {"type": "integer", "description": "Organization profile ID (alternative to href)"},
+                            "ad_image_hashes": {"type": "array", "items": {"type": "string"}, "description": "1-5 image hashes (from yd_ad_images_add)"},
+                            "sitelink_set_id": {"type": "integer", "description": "Sitelink set ID (with href only)"},
+                            "display_url_path": {"type": "string", "description": "Display URL path, max 20 chars (with href only)"},
+                        },
+                        "required": ["ad_group_id", "titles", "texts"],
+                    },
+                },
+            },
+            "required": ["ads"],
+        },
+    ),
+    Tool(
         name="yd_ads_update",
         description="Update existing text ads. Can change title, text, href, sitelinks, image, etc.",
         inputSchema={
@@ -318,13 +405,39 @@ TOOLS = [
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "integer", "description": "Ad ID to update"},
+                            "id": {"type": ["integer", "string"], "description": "Ad ID to update. Pass a 19-digit ID as a STRING."},
                             "title": {"type": "string", "description": "New title (max 56 chars)"},
                             "title2": {"type": "string", "description": "New second title (max 30 chars)"},
                             "text": {"type": "string", "description": "New text (max 81 chars)"},
                             "href": {"type": "string", "description": "New landing page URL"},
                             "sitelink_set_id": {"type": "integer", "description": "Sitelink set ID"},
                             "ad_image_hash": {"type": "string", "description": "Image hash"},
+                        },
+                        "required": ["id"],
+                    },
+                },
+            },
+            "required": ["ads"],
+        },
+    ),
+    Tool(
+        name="yd_ads_update_combinatorial",
+        description="Update a COMBINATORIAL (ResponsiveAd) ad by ID — change headlines/texts/href/images. Only pass fields you want changed; titles/texts, if given, REPLACE the whole array (1-7 titles, 1-3 texts).",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "ads": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": ["integer", "string"], "description": "Ad ID to update. Pass a 19-digit ID as a STRING."},
+                            "titles": {"type": "array", "items": {"type": "string"}, "description": "New full array of 1-7 headlines (replaces existing), max 56 chars each"},
+                            "texts": {"type": "array", "items": {"type": "string"}, "description": "New full array of 1-3 texts (replaces existing), max 81 chars each"},
+                            "href": {"type": "string", "description": "New landing page URL"},
+                            "ad_image_hashes": {"type": "array", "items": {"type": "string"}, "description": "New 1-5 image hashes"},
+                            "sitelink_set_id": {"type": "integer", "description": "Sitelink set ID"},
+                            "display_url_path": {"type": "string", "description": "Display URL path, max 20 chars"},
                         },
                         "required": ["id"],
                     },
@@ -341,20 +454,35 @@ TOOLS = [
             "properties": {
                 "campaign_ids": {"type": "array", "items": {"type": "integer"}},
                 "ad_group_ids": {"type": "array", "items": {"type": "integer"}},
-                "ad_ids": {"type": "array", "items": {"type": "integer"}},
+                "ad_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "Ad IDs. Pass 19-digit combinatorial ad IDs as STRINGS - JSON numbers lose precision above 2**53."},
             },
         },
     ),
     Tool(
         name="yd_ads_action",
-        description="Moderate, suspend, resume, archive, or unarchive ads.",
+        description="Moderate, suspend, resume, archive, unarchive, or DELETE ads by ID. Works for ALL ad types including combinatorial (ResponsiveAd).",
         inputSchema={
             "type": "object",
             "properties": {
-                "ad_ids": {"type": "array", "items": {"type": "integer"}},
-                "action": {"type": "string", "enum": ["moderate", "suspend", "resume", "archive", "unarchive"]},
+                "ad_ids": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "Ad IDs. Pass 19-digit combinatorial ad IDs as STRINGS."},
+                "action": {"type": "string", "enum": ["moderate", "suspend", "resume", "archive", "unarchive", "delete"]},
             },
             "required": ["ad_ids", "action"],
+        },
+    ),
+    Tool(
+        name="yd_keywords_action",
+        description=("Suspend or resume keywords BY ID. Works for autotargeting entities too "
+                     "(the '---autotargeting' pseudo-keyword, ids from yd_autotargeting_get) — "
+                     "that is how you switch autotargeting on and off."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "keyword_ids": {"type": "array", "items": {"type": ["integer", "string"]},
+                                "description": "Keyword or autotargeting IDs"},
+                "action": {"type": "string", "enum": ["suspend", "resume"]},
+            },
+            "required": ["keyword_ids", "action"],
         },
     ),
     Tool(
@@ -388,6 +516,47 @@ TOOLS = [
                 "campaign_ids": {"type": "array", "items": {"type": "integer"}},
                 "ad_group_ids": {"type": "array", "items": {"type": "integer"}},
                 "keyword_ids": {"type": "array", "items": {"type": "integer"}},
+            },
+        },
+    ),
+    Tool(
+        name="yd_autotargeting_get",
+        description=(
+            "Read autotargeting settings (categories Exact/Narrow/Alternative/Accessory/Broader and brand "
+            "options) for every '---autotargeting' in the given campaigns, ad groups or keyword ids."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_ids": {"type": "array", "items": {"type": "integer"}},
+                "ad_group_ids": {"type": "array", "items": {"type": "integer"}},
+                "keyword_ids": {"type": "array", "items": {"type": "integer"}},
+            },
+        },
+    ),
+    Tool(
+        name="yd_autotargeting_update",
+        description=(
+            "Turn autotargeting categories on/off in bulk. Selects every '---autotargeting' under the given "
+            "campaigns/ad groups (or explicit keyword_ids) and updates AutotargetingSettings. Only the "
+            "categories you pass are changed. Narrowing Broader/Alternative/Accessory to NO is the standard "
+            "fix for junk traffic."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "campaign_ids": {"type": "array", "items": {"type": "integer"}},
+                "ad_group_ids": {"type": "array", "items": {"type": "integer"}},
+                "keyword_ids": {"type": "array", "items": {"type": "integer"},
+                                "description": "Explicit autotargeting keyword ids (skips lookup)"},
+                "exact": {"type": "string", "enum": ["YES", "NO"], "description": "Autotargeting category Exact"},
+                "narrow": {"type": "string", "enum": ["YES", "NO"], "description": "Autotargeting category Narrow"},
+                "alternative": {"type": "string", "enum": ["YES", "NO"], "description": "Autotargeting category Alternative"},
+                "accessory": {"type": "string", "enum": ["YES", "NO"], "description": "Autotargeting category Accessory"},
+                "broader": {"type": "string", "enum": ["YES", "NO"], "description": "Autotargeting category Broader"},
+                "without_brands": {"type": "string", "enum": ["YES", "NO"]},
+                "with_advertiser_brand": {"type": "string", "enum": ["YES", "NO"]},
+                "with_competitors_brand": {"type": "string", "enum": ["YES", "NO"]},
             },
         },
     ),
@@ -450,15 +619,24 @@ TOOLS = [
                         "AD_PERFORMANCE_REPORT",
                         "CRITERIA_PERFORMANCE_REPORT",
                         "SEARCH_QUERY_PERFORMANCE_REPORT",
+                        "CUSTOM_REPORT",
                     ],
                     "description": "Report type",
                 },
                 "field_names": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Fields: CampaignName, AdGroupName, Impressions, Clicks, Cost, Ctr, AvgCpc, etc.",
+                    "description": "Fields: CampaignName, AdGroupName, Impressions, Clicks, Cost, Ctr, AvgCpc, etc. Placement и AdNetworkType доступны ТОЛЬКО при report_type=CUSTOM_REPORT.",
                 },
                 "campaign_ids": {"type": "array", "items": {"type": "integer"}, "description": "Filter by campaigns"},
+                "goals": {"type": "array", "items": {"type": "integer"}, "description": "Metrika goal IDs: conversion columns are counted ONLY for these goals. Without it Direct counts by the campaign's own conversion goals."},
+                "attribution_models": {"type": "array", "items": {"type": "string", "enum": ["AUTO", "LSC", "LYDC", "LC", "FC"]}, "description": "Attribution model. ВНИМАНИЕ: Директ сам резолвит LYDC в AUTO — суффикс колонки в ответе (_AUTO/_LSCCD/_LC/_FCCD) показывает РЕАЛЬНО применённую модель, сверяйся с ним, а не с тем, что запросил. Без параметра применяется LSCCD. Значения *_S (LSC_S/LYDC_S/FC_S/LC_S) API отвергает с ошибкой 8000 — убраны."},
+                "include_vat": {"type": "boolean", "description": "Include VAT in Cost. Default true."},
+                "include_discount": {"type": "boolean", "description": "Include discount. Default false."},
+                "limit": {"type": "integer", "description": "Max rows (Page.Limit). Use it instead of pulling the whole report."},
+                "offset": {"type": "integer", "description": "Row offset (Page.Offset), requires limit."},
+                "order_by": {"type": "array", "items": {"type": "object", "properties": {"field": {"type": "string"}, "sort_order": {"type": "string", "enum": ["ASCENDING", "DESCENDING"]}}, "required": ["field"]}, "description": "Server-side sorting, e.g. [{\"field\": \"Cost\", \"sort_order\": \"DESCENDING\"}]"},
+                "filters": {"type": "array", "items": {"type": "object", "properties": {"field": {"type": "string"}, "operator": {"type": "string"}, "values": {"type": "array", "items": {"type": "string"}}}, "required": ["field", "operator", "values"]}, "description": "Extra filters, e.g. [{\"field\": \"AdNetworkType\", \"operator\": \"EQUALS\", \"values\": [\"AD_NETWORK\"]}]"},
             },
             "required": ["date_from", "date_to", "report_type", "field_names"],
         },
@@ -601,6 +779,9 @@ TOOLS = [
             "properties": {
                 "campaign_ids": {"type": "array", "items": {"type": "integer"}},
                 "ad_group_ids": {"type": "array", "items": {"type": "integer"}},
+                "ids": {"type": "array", "items": {"type": "integer"}, "description": "Bid modifier IDs"},
+                "types": {"type": "array", "items": {"type": "string"}, "description": "e.g. DEMOGRAPHICS_ADJUSTMENT, MOBILE_ADJUSTMENT"},
+                "levels": {"type": "array", "items": {"type": "string", "enum": ["CAMPAIGN", "AD_GROUP"]}, "description": "Defaults to both. Required by the API."},
             },
         },
     ),
@@ -917,6 +1098,7 @@ TOOLS = [
                         "required": ["name", "image_data"],
                     },
                 },
+                "force": {"type": "boolean", "description": "Skip the local format pre-check and upload as-is"},
             },
             "required": ["images"],
         },
@@ -974,12 +1156,12 @@ TOOLS = [
     # ── Wordstat API ───────────────────────────────────────────────────
     Tool(
         name="yd_wordstat_top_requests",
-        description="Get popular search queries containing a keyword from Yandex Wordstat (last 30 days). Returns phrases with search counts. 1 quota unit per request.",
+        description="Get popular search queries containing a keyword from Yandex Wordstat (last 30 days). Returns up to 2000 related phrases with search counts in ONE request. Wordstat has NO batch endpoint (one seed phrase per request) and a hard quota of 100 requests/HOUR; each request costs 1 unit no matter how many phrases it returns. So keep num_phrases=2000 (the default) and cover each seed in a single call — never make one request per keyword.",
         inputSchema={
             "type": "object",
             "properties": {
                 "phrase": {"type": "string", "description": "Keyword to analyze"},
-                "num_phrases": {"type": "integer", "description": "How many related phrases to return, 1-2000 (default 30)"},
+                "num_phrases": {"type": "integer", "description": "Related phrases to return, 1-2000. DEFAULT 2000 (max). Quota is only 100 requests/HOUR and cost is per-request regardless of count — ALWAYS keep this at the max; only lower it if you specifically need a short list."},
                 "regions": {"type": "array", "items": {"type": "integer"}, "description": "Region IDs (optional, omit for all Russia)"},
                 "devices": {"type": "string", "enum": ["all", "desktop", "phone", "tablet"], "description": "Device filter (default: all)"},
             },
@@ -988,14 +1170,14 @@ TOOLS = [
     ),
     Tool(
         name="yd_wordstat_dynamics",
-        description="Get search frequency dynamics over time for a keyword. Date alignment is enforced by the API: monthly → both dates must be the 1st of a month; weekly → from=Monday, to=Sunday; daily → any dates.",
+        description="Get search frequency dynamics over time for a keyword. Date alignment is enforced by the API: monthly → from_date = 1st of a month, to_date = LAST day of a month (e.g. 2026-07-31); weekly → from=Monday, to=Sunday; daily → any dates.",
         inputSchema={
             "type": "object",
             "properties": {
                 "phrase": {"type": "string", "description": "Keyword to analyze"},
                 "period": {"type": "string", "enum": ["monthly", "weekly", "daily"], "description": "Time granularity"},
                 "from_date": {"type": "string", "description": "Start date YYYY-MM-DD (monthly: 1st of month; weekly: a Monday)"},
-                "to_date": {"type": "string", "description": "End date YYYY-MM-DD (monthly: 1st of month; weekly: a Sunday)"},
+                "to_date": {"type": "string", "description": "End date YYYY-MM-DD (monthly: LAST day of month; weekly: a Sunday)"},
                 "regions": {"type": "array", "items": {"type": "integer"}, "description": "Region IDs (optional)"},
                 "devices": {"type": "string", "enum": ["all", "desktop", "phone", "tablet"]},
             },
@@ -1045,9 +1227,81 @@ def _augment_schema(tool: Tool) -> Tool:
     return Tool(name=tool.name, description=tool.description, inputSchema=schema)
 
 
+_ESSENTIAL = {
+    # Direct read
+    "yd_campaigns_get","yd_adgroups_get","yd_ads_get","yd_keywords_get",
+    "yd_keyword_bids_get","yd_bid_modifiers_get","yd_report","yd_dictionaries",
+    "yd_changes_check","yd_clients_get","yd_keywords_has_volume",
+    "yd_negative_keywords_sets_get",
+    # Direct write
+    "yd_campaigns_add","yd_campaigns_update","yd_campaigns_action",
+    "yd_adgroups_add","yd_adgroups_delete","yd_keywords_delete","yd_keywords_action","yd_ads_add","yd_ads_add_combinatorial","yd_ads_update","yd_ads_update_combinatorial","yd_ads_action",
+    "yd_autotargeting_get","yd_autotargeting_update",
+    "yd_keywords_add","yd_bids_set","yd_keyword_bids_set","yd_keyword_bids_set_auto",
+    "yd_bid_modifiers_add","yd_bid_modifiers_set","yd_bid_modifiers_delete",
+    "yd_negative_keywords_sets_add","yd_negative_keywords_sets_update",
+    "yd_campaign_strategy_update","yd_excluded_sites_update","yd_excluded_sites_get",
+    # Metrika
+    "yd_metrika_counters_get","yd_metrika_goals_get","yd_metrika_report",
+    "yd_metrika_report_comparison","yd_metrika_report_by_time",
+    "yd_wordstat_top_requests",
+}
+
+def _platform_tag(old_name):
+    if old_name.startswith("yd_metrika"):
+        return "Yandex Metrika / \u042f\u043d\u0434\u0435\u043a\u0441 \u041c\u0435\u0442\u0440\u0438\u043a\u0430 (web analytics). "
+    if old_name.startswith("yd_wordstat"):
+        return "Yandex Wordstat / \u042f\u043d\u0434\u0435\u043a\u0441 \u0412\u043e\u0440\u0434\u0441\u0442\u0430\u0442 (keyword research). "
+    return "Yandex Direct / \u042f\u043d\u0434\u0435\u043a\u0441 \u0414\u0438\u0440\u0435\u043a\u0442 (search/context ads). "
+
+
+def _rename(old):
+    if old.startswith("yd_metrika_"):
+        return "yandex_metrika_" + old[len("yd_metrika_"):]
+    if old.startswith("yd_wordstat_"):
+        return "yandex_wordstat_" + old[len("yd_wordstat_"):]
+    if old.startswith("yd_"):
+        return "yandex_direct_" + old[len("yd_"):]
+    return old
+
+
+def _unrename(new):
+    if new.startswith("yandex_metrika_"):
+        return "yd_metrika_" + new[len("yandex_metrika_"):]
+    if new.startswith("yandex_wordstat_"):
+        return "yd_wordstat_" + new[len("yandex_wordstat_"):]
+    if new.startswith("yandex_direct_"):
+        return "yd_" + new[len("yandex_direct_"):]
+    return new
+
+
 @server.list_tools()
 async def list_tools():
-    return [_augment_schema(t) for t in (TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS + AUDIENCE_TOOLS)]
+    # апстрим отдаёт список плоско; нам нужны свои слои: аудитории добавлены,
+    # но переименование под tool-search, READONLY-фильтр и YD_LEAN сохраняем
+    _all = TOOLS + METRIKA_TOOLS + EXTRA_DIRECT_TOOLS + AUDIENCE_TOOLS
+    # мердж апстрима 06.09.2026 принёс второй тул с именем yd_keywords_delete и ДРУГОЙ
+    # схемой (ids вместо keyword_ids). Диспетчер всё равно попадает в первый, поэтому
+    # объявлять оба — значит обещать схему, по которой тул падает. Побеждает первый.
+    _seen, _uniq = set(), []
+    for _t in _all:
+        if _t.name in _seen:
+            logger.warning("дубликат тула %s — второй не объявляем", _t.name)
+            continue
+        _seen.add(_t.name)
+        _uniq.append(_t)
+    _all = _uniq
+    if READONLY:
+        _all = [t for t in _all if not _is_mutating(t.name)]
+    if _env_bool("YD_LEAN"):
+        _all = [t for t in _all if t.name in _ESSENTIAL]
+    out = []
+    for t in _all:
+        at = _augment_schema(t)
+        out.append(Tool(name=_rename(at.name),
+                        description=_platform_tag(at.name) + at.description,
+                        inputSchema=at.inputSchema))
+    return out
 
 
 def _rubles_to_micros(rubles: float) -> int:
@@ -1059,6 +1313,7 @@ def _rubles_to_micros(rubles: float) -> int:
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
+    name = _unrename(name)
     arguments = dict(arguments or {})
     # Cross-cutting controls (not forwarded to the Yandex API)
     req_login = arguments.pop("client_login", None)
@@ -1100,18 +1355,32 @@ async def _dispatch(name: str, arguments: dict):
                 return await _handle_adgroups_add(client, arguments)
             elif name == "yd_adgroups_get":
                 return await _handle_adgroups_get(client, arguments)
+            elif name == "yd_adgroups_delete":
+                return await _handle_adgroups_delete(client, arguments)
+            elif name == "yd_keywords_delete":
+                return await _handle_keywords_delete(client, arguments)
             elif name == "yd_ads_add":
                 return await _handle_ads_add(client, arguments)
+            elif name == "yd_ads_add_combinatorial":
+                return await _handle_ads_add_combinatorial(client, arguments)
             elif name == "yd_ads_update":
                 return await _handle_ads_update(client, arguments)
+            elif name == "yd_ads_update_combinatorial":
+                return await _handle_ads_update_combinatorial(client, arguments)
             elif name == "yd_ads_get":
                 return await _handle_ads_get(client, arguments)
             elif name == "yd_ads_action":
                 return await _handle_ads_action(client, arguments)
+            elif name == "yd_keywords_action":
+                return await _handle_keywords_action(client, arguments)
             elif name == "yd_keywords_add":
                 return await _handle_keywords_add(client, arguments)
             elif name == "yd_keywords_get":
                 return await _handle_keywords_get(client, arguments)
+            elif name == "yd_autotargeting_get":
+                return await _handle_autotargeting_get(client, arguments)
+            elif name == "yd_autotargeting_update":
+                return await _handle_autotargeting_update(client, arguments)
             elif name == "yd_keywords_research":
                 return await _handle_keywords_research(client, arguments)
             elif name == "yd_bids_set":
@@ -1203,6 +1472,40 @@ async def _dispatch(name: str, arguments: dict):
             return [TextContent(type="text", text=f"Error: {e}")]
 
 
+async def _report_rows(client, date_from, date_to, field_names,
+                       report_type="CAMPAIGN_PERFORMANCE_REPORT"):
+    """Сырые строки отчёта. Нужны, чтобы увидеть кампании, которых нет в campaigns.get
+    (Мастер кампаний: API их не отдаёт, update/suspend отвечают Code 3500)."""
+    url = f"{_base_url()}/reports"
+    body = {"params": {
+        "SelectionCriteria": {"DateFrom": date_from, "DateTo": date_to},
+        "FieldNames": field_names,
+        "ReportName": f"universe_{date_from}_{date_to}_{int(time.time()*1000)}",
+        "ReportType": report_type, "DateRangeType": "CUSTOM_DATE",
+        "Format": "TSV", "IncludeVAT": "YES", "IncludeDiscount": "NO"}}
+    headers = _headers()
+    headers.update({"processingMode": "auto", "returnMoneyInMicros": "false",
+                    "skipReportHeader": "true", "skipReportSummary": "true"})
+    for _ in range(30):
+        resp = await client.post(url, headers=headers, json=body, timeout=120)
+        if resp.status_code == 200:
+            lines = [l for l in resp.text.splitlines() if l]
+            if not lines:
+                return []
+            cols = lines[0].split(chr(9))
+            return [dict(zip(cols, l.split(chr(9)))) for l in lines[1:]]
+        if resp.status_code in (201, 202):
+            await asyncio.sleep(int(resp.headers.get("retryIn", 5)))
+            continue
+        return []
+    return []
+
+
+MK_NOTE = ("Мастер кампаний: campaigns.get её не возвращает ни по типу, ни по прямому Id; "
+           "update и suspend отвечают Code 3500 (Тип кампании не поддерживается). "
+           "Статистика видна только в отчётах, настройки правятся вручную в интерфейсе Директа.")
+
+
 async def _handle_campaigns_get(client, args):
     criteria = {}
     if ids := args.get("ids"):
@@ -1213,10 +1516,36 @@ async def _handle_campaigns_get(client, args):
         criteria["States"] = states
     params = {
         "SelectionCriteria": criteria,
-        "FieldNames": ["Id", "Name", "Status", "State", "Type", "StartDate", "DailyBudget", "Statistics"],
+        "FieldNames": ["Id", "Name", "Status", "State", "Type", "StartDate", "DailyBudget", "Statistics", "NegativeKeywords"],
     }
     data = await _api(client, "campaigns", "get", params)
-    return _result(data.get("result", data))
+    result = data.get("result", data)
+    if args.get("include_unmanageable", True) and isinstance(result, dict):
+        try:
+            seen = {str(c.get("Id")) for c in (result.get("Campaigns") or [])}
+            want = {str(i) for i in (args.get("ids") or [])}
+            today = datetime.date.today()
+            rows = await _report_rows(
+                client, (today - datetime.timedelta(days=30)).isoformat(), today.isoformat(),
+                ["CampaignId", "CampaignName", "Clicks", "Cost"])
+            agg = {}
+            for r in rows:
+                cid = r.get("CampaignId")
+                if not cid or cid in seen:
+                    continue
+                if want and cid not in want:
+                    continue
+                a = agg.setdefault(cid, {"Id": int(cid), "Name": r.get("CampaignName"),
+                                         "Type": "MASTER_CAMPAIGN", "ApiManageable": False,
+                                         "Note": MK_NOTE, "Clicks30d": 0, "Cost30d": 0.0})
+                a["Clicks30d"] += int(r.get("Clicks") or 0)
+                a["Cost30d"] = round(a["Cost30d"] + float(r.get("Cost") or 0), 2)
+            if agg:
+                result.setdefault("Campaigns", []).extend(agg.values())
+                result["UnmanageableCampaigns"] = len(agg)
+        except Exception as e:
+            result["UnmanageableProbeError"] = str(e)[:200]
+    return _result(result)
 
 
 async def _handle_campaigns_add(client, args):
@@ -1350,6 +1679,9 @@ async def _handle_campaigns_update(client, args):
             "Mode": args.get("daily_budget_mode", "DISTRIBUTED"),
         }
     if neg := args.get("negative_keywords"):
+        mode = (args.get("negative_keywords_mode") or "replace").lower()
+        if mode == "append":
+            neg = await _merge_campaign_negatives(client, args["campaign_id"], neg)
         campaign["NegativeKeywords"] = {"Items": neg}
     if end_date := args.get("end_date"):
         campaign["EndDate"] = end_date
@@ -1416,6 +1748,25 @@ async def _handle_ads_add(client, args):
     return _result(data.get("result", data))
 
 
+async def _handle_ads_add_combinatorial(client, args):
+    ads = []
+    for a in args["ads"]:
+        resp = {"Titles": a["titles"], "Texts": a["texts"]}
+        if href := a.get("href"):
+            resp["Href"] = href
+        if business_id := a.get("business_id"):
+            resp["BusinessId"] = business_id
+        if hashes := a.get("ad_image_hashes"):
+            resp["AdImageHashes"] = hashes
+        if sitelink_id := a.get("sitelink_set_id"):
+            resp["SitelinkSetId"] = sitelink_id
+        if dup := a.get("display_url_path"):
+            resp["DisplayUrlPath"] = dup
+        ads.append({"AdGroupId": a["ad_group_id"], "ResponsiveAd": resp})
+    data = await _api(client, "ads", "add", {"Ads": ads}, version="v501")
+    return _result(data.get("result", data))
+
+
 async def _handle_ads_update(client, args):
     ads = []
     for a in args["ads"]:
@@ -1437,6 +1788,29 @@ async def _handle_ads_update(client, args):
     return _result(data.get("result", data))
 
 
+async def _handle_ads_update_combinatorial(client, args):
+    ads = []
+    for a in args["ads"]:
+        resp = {}
+        if titles := a.get("titles"):
+            resp["Titles"] = titles
+        if texts := a.get("texts"):
+            resp["Texts"] = texts
+        if href := a.get("href"):
+            resp["Href"] = href
+        if hashes := a.get("ad_image_hashes"):
+            # ads.update (v501) wants an ArrayOfString wrapper here, while ads.add
+            # takes a bare list; a bare list on update fails with error 8000.
+            resp["AdImageHashes"] = {"Items": hashes}
+        if sitelink_id := a.get("sitelink_set_id"):
+            resp["SitelinkSetId"] = sitelink_id
+        if dup := a.get("display_url_path"):
+            resp["DisplayUrlPath"] = dup
+        ads.append({"Id": _as_ids([a["id"]])[0], "ResponsiveAd": resp})
+    data = await _api(client, "ads", "update", {"Ads": ads}, version="v501")
+    return _result(data.get("result", data))
+
+
 async def _handle_ads_get(client, args):
     criteria = {}
     if ids := args.get("campaign_ids"):
@@ -1448,16 +1822,26 @@ async def _handle_ads_get(client, args):
     params = {
         "SelectionCriteria": criteria,
         "FieldNames": ["Id", "AdGroupId", "CampaignId", "Status", "State", "Type"],
-        "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "Mobile"],
+        "TextAdFieldNames": ["Title", "Title2", "Text", "Href", "Mobile", "AdImageHash", "SitelinkSetId", "DisplayUrlPath"],
+        "ResponsiveAdFieldNames": ["Titles", "Texts", "Href", "AdImages", "SitelinkSetId", "DisplayUrlPath"],
     }
-    data = await _api(client, "ads", "get", params)
+    data = await _api(client, "ads", "get", params, version="v501")
     return _result(data.get("result", data))
 
 
 async def _handle_ads_action(client, args):
     action = args["action"]
-    params = {"SelectionCriteria": {"Ids": args["ad_ids"]}}
+    params = {"SelectionCriteria": {"Ids": _as_ids(args["ad_ids"])}}
     data = await _api(client, "ads", action, params)
+    return _result(data.get("result", data))
+
+
+async def _handle_keywords_action(client, args):
+    """keywords.suspend / keywords.resume. Автотаргетинг живёт как обычный ключ,
+    поэтому включается и гасится этим же методом."""
+    action = args["action"]
+    params = {"SelectionCriteria": {"Ids": _as_ids(args["keyword_ids"])}}
+    data = await _api(client, "keywords", action, params)
     return _result(data.get("result", data))
 
 
@@ -1485,10 +1869,138 @@ async def _handle_keywords_get(client, args):
         criteria["Ids"] = ids
     params = {
         "SelectionCriteria": criteria,
-        "FieldNames": ["Id", "Keyword", "AdGroupId", "CampaignId", "Status", "State", "Bid"],
+        "FieldNames": ["Id", "Keyword", "AdGroupId", "CampaignId", "Status", "State", "Bid", "AutotargetingCategories"],
+        "AutotargetingSettingsCategoriesFieldNames": list(_AT_CATEGORIES),
+        "AutotargetingSettingsBrandOptionsFieldNames": list(_AT_BRANDS),
     }
     data = await _api(client, "keywords", "get", params)
     return _result(data.get("result", data))
+
+
+# ── Autotargeting (Keywords "---autotargeting") ─────────────────────────
+
+_AT_CATEGORIES = ("Exact", "Narrow", "Alternative", "Accessory", "Broader")
+_AT_BRANDS = ("WithoutBrands", "WithAdvertiserBrand", "WithCompetitorsBrand")
+_AT_BRAND_ARGS = {"WithoutBrands": "without_brands",
+                  "WithAdvertiserBrand": "with_advertiser_brand",
+                  "WithCompetitorsBrand": "with_competitors_brand"}
+_AT_KEYWORD = "---autotargeting"
+
+
+def _neg_key(phrase):
+    """Normalized key for a negative keyword: Yandex stores them with !/+ operators."""
+    return " ".join(str(phrase).replace("!", "").replace("+", "").lower().split())
+
+
+def _yesno(v):
+    if isinstance(v, bool):
+        return "YES" if v else "NO"
+    return "YES" if str(v).strip().lower() in ("yes", "true", "1", "on") else "NO"
+
+
+async def _merge_campaign_negatives(client, campaign_id, extra):
+    """Return existing campaign negatives + extra (dedup, case-insensitive, order kept)."""
+    data = await _api(client, "campaigns", "get", {
+        "SelectionCriteria": {"Ids": [campaign_id]},
+        "FieldNames": ["Id", "NegativeKeywords"],
+    })
+    items = ((data.get("result") or {}).get("Campaigns") or [])
+    current = []
+    if items:
+        current = ((items[0].get("NegativeKeywords") or {}).get("Items") or [])
+    merged, seen = [], set()
+    for phrase in list(current) + list(extra):
+        key = _neg_key(phrase)
+        if key and key not in seen:
+            seen.add(key)
+            merged.append(phrase)
+    return merged
+
+
+async def _autotargeting_fetch(client, args):
+    """All ---autotargeting pseudo-keywords under the given campaigns/groups/ids."""
+    criteria = {}
+    if ids := args.get("campaign_ids"):
+        criteria["CampaignIds"] = ids
+    if ids := args.get("ad_group_ids"):
+        criteria["AdGroupIds"] = ids
+    if ids := args.get("keyword_ids"):
+        criteria["Ids"] = ids
+    if not criteria:
+        raise Exception("Provide campaign_ids, ad_group_ids or keyword_ids")
+
+    found, offset, limit = [], 0, 10000
+    while True:
+        params = {
+            "SelectionCriteria": criteria,
+            "FieldNames": ["Id", "Keyword", "AdGroupId", "CampaignId", "State", "Status", "AutotargetingCategories"],
+            "AutotargetingSettingsCategoriesFieldNames": list(_AT_CATEGORIES),
+            "AutotargetingSettingsBrandOptionsFieldNames": list(_AT_BRANDS),
+            "Page": {"Limit": limit, "Offset": offset},
+        }
+        data = await _api(client, "keywords", "get", params)
+        result = data.get("result") or {}
+        batch = result.get("Keywords") or []
+        found.extend(k for k in batch if k.get("Keyword") == _AT_KEYWORD)
+        if len(batch) < limit:
+            break
+        offset += limit
+        if offset >= 200000:
+            break
+    return found
+
+
+async def _handle_autotargeting_get(client, args):
+    items = await _autotargeting_fetch(client, args)
+    rows = []
+    for k in items:
+        settings = k.get("AutotargetingSettings") or {}
+        rows.append({
+            "KeywordId": k.get("Id"),
+            "AdGroupId": k.get("AdGroupId"),
+            "CampaignId": k.get("CampaignId"),
+            "State": k.get("State"),
+            "Categories": settings.get("Categories") or {},
+            "BrandOptions": settings.get("BrandOptions") or {},
+        })
+    return _result({"Count": len(rows), "Autotargetings": rows})
+
+
+async def _handle_autotargeting_update(client, args):
+    categories = {c: _yesno(args[c.lower()]) for c in _AT_CATEGORIES if args.get(c.lower()) is not None}
+    brands = {}
+    for b, snake in _AT_BRAND_ARGS.items():
+        if args.get(snake) is not None:
+            brands[b] = _yesno(args[snake])
+    if not categories and not brands:
+        raise Exception("Nothing to change: pass at least one of exact/narrow/alternative/accessory/broader "
+                        "or without_brands/with_advertiser_brand/with_competitors_brand")
+
+    settings = {}
+    if categories:
+        settings["Categories"] = categories
+    if brands:
+        settings["BrandOptions"] = brands
+
+    ids = args.get("keyword_ids")
+    if not ids:
+        ids = [k["Id"] for k in await _autotargeting_fetch(client, args)]
+    if not ids:
+        return _result({"Updated": 0, "Note": "no ---autotargeting found for the given selection"})
+
+    updated, errors = [], []
+    for i in range(0, len(ids), 1000):
+        chunk = ids[i:i + 1000]
+        data = await _api(client, "keywords", "update", {
+            "Keywords": [{"Id": kid, "AutotargetingSettings": settings} for kid in chunk],
+        })
+        for item in ((data.get("result") or {}).get("UpdateResults") or []):
+            if item.get("Errors"):
+                errors.append(item)
+            elif item.get("Id"):
+                updated.append(item["Id"])
+    return _result({"Applied": settings, "Updated": len(updated), "Errors": errors[:20],
+                    "ErrorCount": len(errors)})
 
 
 async def _handle_keywords_research(client, args):
@@ -1525,18 +2037,36 @@ async def _handle_report(client, args):
                 "DateTo": args["date_to"],
             },
             "FieldNames": args["field_names"],
-            "ReportName": f"report_{args['date_from']}_{args['date_to']}",
+            "ReportName": f"report_{args['date_from']}_{args['date_to']}_{int(time.time()*1000)}",
             "ReportType": args["report_type"],
             "DateRangeType": "CUSTOM_DATE",
             "Format": "TSV",
-            "IncludeVAT": "YES",
-            "IncludeDiscount": "NO",
+            "IncludeVAT": "YES" if args.get("include_vat", True) else "NO",
+            "IncludeDiscount": "YES" if args.get("include_discount", False) else "NO",
         }
     }
+    _p = body["params"]
+    if goals := args.get("goals"):
+        _p["Goals"] = [str(g) for g in goals]
+    if models := args.get("attribution_models"):
+        _p["AttributionModels"] = models
+    if (lim := args.get("limit")) is not None:
+        page = {"Limit": int(lim)}
+        if (off := args.get("offset")) is not None:
+            page["Offset"] = int(off)
+        _p["Page"] = page
+    if ob := args.get("order_by"):
+        _p["OrderBy"] = [{"Field": o["field"],
+                          "SortOrder": o.get("sort_order", "DESCENDING")} for o in ob]
+    flt = []
     if campaign_ids := args.get("campaign_ids"):
-        body["params"]["SelectionCriteria"]["Filter"] = [
-            {"Field": "CampaignId", "Operator": "IN", "Values": [str(i) for i in campaign_ids]}
-        ]
+        flt.append({"Field": "CampaignId", "Operator": "IN",
+                    "Values": [str(i) for i in campaign_ids]})
+    for f in args.get("filters") or []:
+        flt.append({"Field": f["field"], "Operator": f["operator"],
+                    "Values": [str(v) for v in f["values"]]})
+    if flt:
+        body["params"]["SelectionCriteria"]["Filter"] = flt
 
     headers = _headers()
     headers["processingMode"] = "auto"
@@ -1584,19 +2114,12 @@ async def _handle_keywords_has_volume(client, args):
 # ── KeywordBids ────────────────────────────────────────────────────────
 
 async def _handle_keyword_bids_get(client, args):
-    criteria = {}
-    if ids := args.get("campaign_ids"):
-        criteria["CampaignIds"] = ids
-    if ids := args.get("ad_group_ids"):
-        criteria["AdGroupIds"] = ids
-    if ids := args.get("keyword_ids"):
-        criteria["Ids"] = ids
-    params = {
-        "SelectionCriteria": criteria,
-        "FieldNames": ["KeywordId", "AdGroupId", "CampaignId", "SearchBid", "NetworkBid", "CurrentSearchPrice", "MinSearchPrice"],
-    }
-    data = await _api(client, "keywordbids", "get", params)
-    return _result(data.get("result", data))
+    """Аукцион по фразам. # money_ext: делегируем в tools_money.
+
+    Штатная реализация запрашивала поля старого сервиса bids и получала 8000.
+    """
+    import tools_money
+    return await tools_money._handle_bids_auction_get(client, args, _extra_config)
 
 
 async def _handle_keyword_bids_set(client, args):
@@ -1613,25 +2136,17 @@ async def _handle_keyword_bids_set(client, args):
 
 
 async def _handle_keyword_bids_set_auto(client, args):
-    bids = []
-    for b in args["bids"]:
-        item = {"KeywordId": b["keyword_id"]}
-        auto = {}
-        if scope := b.get("scope"):
-            auto["Scope"] = [scope]
-        if pos := b.get("position"):
-            auto["Position"] = pos
-        if mb := b.get("max_bid"):
-            auto["MaxBid"] = _rubles_to_micros(mb)
-        if inc := b.get("increase_percent"):
-            auto["IncreasePercent"] = inc
-        item["SearchAutoStrategy"] = auto
-        bids.append(item)
-    data = await _api(client, "keywordbids", "setAuto", {"KeywordBids": bids})
-    return _result(data.get("result", data))
+    """Устаревший тул. # money_ext: делегируем в tools_money.
 
+    Слал позиции PREMIUMBLOCK/P11…, которых в аукционе Директа больше нет.
+    """
+    return _result({
+        "error": "Тул устарел: у Директа больше нет позиций (PREMIUMBLOCK/P11…). "
+                 "Используй yandex_direct_bids_set_by_traffic — целевой объём трафика "
+                 "(5..100) с потолком ставки, или yandex_direct_bids_manual_set для явной ставки. "
+                 "Текущий аукцион смотри в yandex_direct_bids_auction_get.",
+    })
 
-# ── BidModifiers ───────────────────────────────────────────────────────
 
 async def _handle_bid_modifiers_add(client, args):
     modifier = {}
@@ -1669,11 +2184,22 @@ async def _handle_bid_modifiers_get(client, args):
         criteria["CampaignIds"] = ids
     if ids := args.get("ad_group_ids"):
         criteria["AdGroupIds"] = ids
+    if ids := args.get("ids"):
+        criteria["Ids"] = ids
+    if types := args.get("types"):
+        criteria["Types"] = types
+    # Levels обязателен: без него API отвечает 8000
+    criteria["Levels"] = args.get("levels") or ["CAMPAIGN", "AD_GROUP"]
     params = {
         "SelectionCriteria": criteria,
-        "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type",
-                        "MobileAdjustment", "DesktopAdjustment", "TabletAdjustment",
-                        "DemographicsAdjustments", "RegionalAdjustments"],
+        "FieldNames": ["Id", "CampaignId", "AdGroupId", "Type", "Level"],
+        # вложенные корректировки читаются ТОЛЬКО через свои *FieldNames,
+        # в общем FieldNames их просить нельзя
+        "MobileAdjustmentFieldNames": ["BidModifier", "OperatingSystemType"],
+        "DesktopAdjustmentFieldNames": ["BidModifier"],
+        "DemographicsAdjustmentFieldNames": ["Age", "Gender", "BidModifier"],
+        "RegionalAdjustmentFieldNames": ["RegionId", "BidModifier"],
+        "RetargetingAdjustmentFieldNames": ["RetargetingConditionId", "BidModifier"],
     }
     data = await _api(client, "bidmodifiers", "get", params)
     return _result(data.get("result", data))
@@ -1705,10 +2231,11 @@ async def _handle_neg_kw_sets_get(client, args):
     criteria = {}
     if ids := args.get("ids"):
         criteria["Ids"] = ids
-    params = {
-        "SelectionCriteria": criteria,
-        "FieldNames": ["Id", "Name", "NegativeKeywords"],
-    }
+    # обход 06.09.2026: пустой SelectionCriteria -> 8000 «Отсутствует Ids»;
+    # без критерия сервис отдаёт все библиотеки минус-слов аккаунта
+    params = {"FieldNames": ["Id", "Name", "NegativeKeywords", "Associated"]}
+    if criteria:
+        params["SelectionCriteria"] = criteria
     data = await _api(client, "negativekeywordsharedsets", "get", params)
     return _result(data.get("result", data))
 
@@ -1742,10 +2269,10 @@ async def _handle_sitelinks_add(client, args):
 
 
 async def _handle_sitelinks_get(client, args):
-    params = {
-        "SelectionCriteria": {"Ids": args["ids"]},
-        "FieldNames": ["Id", "Sitelinks"],
-    }
+    # обход 06.09.2026: без Ids сервис отдаёт все наборы, пустой список Ids ловил 8000
+    params = {"FieldNames": ["Id", "Sitelinks"]}
+    if ids := args.get("ids"):
+        params["SelectionCriteria"] = {"Ids": ids}
     data = await _api(client, "sitelinks", "get", params)
     return _result(data.get("result", data))
 
@@ -1766,7 +2293,8 @@ async def _handle_ad_extensions_add(client, args):
 async def _handle_ad_extensions_get(client, args):
     params = {
         "SelectionCriteria": {"Ids": args["ids"]},
-        "FieldNames": ["Id", "Type", "Callout", "Status"],
+        "FieldNames": ["Id", "Type", "State", "Status", "StatusClarification", "Associated"],
+        "CalloutFieldNames": ["CalloutText"],
     }
     data = await _api(client, "adextensions", "get", params)
     return _result(data.get("result", data))
@@ -1880,9 +2408,39 @@ async def _handle_retargeting_lists_delete(client, args):
 # ── AdImages ──────────────────────────────────────────────────────────
 
 async def _handle_ad_images_add(client, args):
-    images = [{"ImageData": img["image_data"], "Name": img["name"]} for img in args["images"]]
+    # Директ принимает почти любую картинку, но непригодная получает Type=UNFIT и к
+    # объявлению уже не привязывается: "загружено" читается как "годится", хотя это
+    # не так. Отсеиваем до отправки; force=true продавливает исходное поведение.
+    accepted, rejected = image_formats.split_by_fitness(
+        args["images"], force=bool(args.get("force"))
+    )
+    if not accepted:
+        return _result({"AddResults": [], "Rejected": rejected, "Hint": image_formats.HINT})
+
+    images = [{"ImageData": img["image_data"], "Name": img["name"]} for img in accepted]
     data = await _api(client, "adimages", "add", {"AdImages": images})
-    return _result(data.get("result", data))
+    out = data.get("result", data)
+
+    if isinstance(out, dict):
+        # add отдаёт только хеши — дотягиваем Type отдельным запросом.
+        hashes = [
+            r.get("AdImageHash")
+            for r in (out.get("AddResults") or [])
+            if isinstance(r, dict) and r.get("AdImageHash")
+        ]
+        if hashes:
+            try:
+                info = await _api(client, "adimages", "get", {
+                    "SelectionCriteria": {"AdImageHashes": hashes},
+                    "FieldNames": ["AdImageHash", "Name", "Type", "Subtype"],
+                })
+                out["Uploaded"] = (info.get("result") or {}).get("AdImages", [])
+            except Exception as exc:
+                logger.warning("adimages.get after add failed: %s", exc)
+        if rejected:
+            out["Rejected"] = rejected
+            out["Hint"] = image_formats.HINT
+    return _result(out)
 
 
 async def _handle_ad_images_get(client, args):
@@ -1907,10 +2465,10 @@ async def _handle_ad_images_delete(client, args):
 # ── Businesses ────────────────────────────────────────────────────────
 
 async def _handle_businesses_get(client, args):
-    params = {
-        "SelectionCriteria": {"Ids": args["ids"]},
-        "FieldNames": ["Id", "Name", "Address", "Phone", "ProfileUrl", "IsPublished"],
-    }
+    # обход 06.09.2026: без Ids сервис отдаёт все профили, пустой список Ids ловил 4001
+    params = {"FieldNames": ["Id", "Name", "Address", "Phone", "ProfileUrl", "IsPublished"]}
+    if ids := args.get("ids"):
+        params["SelectionCriteria"] = {"Ids": ids}
     data = await _api(client, "businesses", "get", params)
     return _result(data.get("result", data))
 
@@ -1964,9 +2522,25 @@ async def _get_iam_token(client: httpx.AsyncClient) -> str:
     now = time.time()
     if _iam_token_cache["token"] and _iam_token_cache["expires"] > now + 300:
         return _iam_token_cache["token"]
+    if YC_SA_KEY_FILE:
+        import jwt as _jwt, time as _time
+        with open(YC_SA_KEY_FILE, encoding="utf-8") as _f:
+            _k = json.load(_f)
+        _n = int(now)
+        _payload = {
+            "aud": "https://iam.api.cloud.yandex.net/iam/v1/tokens",
+            "iss": _k["service_account_id"],
+            "iat": _n,
+            "exp": _n + 360,
+        }
+        _signed = _jwt.encode(_payload, _k["private_key"], algorithm="PS256",
+                              headers={"kid": _k["id"]})
+        _reqbody = {"jwt": _signed}
+    else:
+        _reqbody = {"yandexPassportOauthToken": TOKEN}
     resp = await client.post(
         "https://iam.api.cloud.yandex.net/iam/v1/tokens",
-        json={"yandexPassportOauthToken": TOKEN},
+        json=_reqbody,
         timeout=30,
     )
     data = resp.json()
@@ -1991,10 +2565,10 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
         "Content-Type": "application/json",
     }
     _log_body("WORDSTAT REQUEST %s: %s", url, json.dumps(body, ensure_ascii=False)[:2000])
-    resp = await client.post(url, headers=headers, json=body, timeout=60)
+    resp = await request_with_retry(client, url, headers=headers, json_body=body, timeout=60, max_attempts=6)
     _log_body("WORDSTAT RESPONSE %s: %s", resp.status_code, resp.text[:2000])
     if resp.status_code == 429:
-        raise Exception(f"Wordstat rate limit exceeded (429). Retry later.")
+        raise Exception("Wordstat rate limit exceeded (429) after retries. Slow the pace or raise the Yandex Cloud folder quota (Search API).")
     if resp.status_code == 503:
         raise Exception(f"Wordstat global quota exceeded (503).")
     if resp.status_code != 200:
@@ -2004,11 +2578,12 @@ async def _wordstat_request(client: httpx.AsyncClient, endpoint: str, body: dict
 
 async def _handle_wordstat_top_requests(client, args):
     # The Wordstat /topRequests endpoint requires numPhrases (1..2000).
-    num = int(args.get("num_phrases", 30))
+    num = int(args.get("num_phrases", 2000))
     num = max(1, min(num, 2000))
     body = {"phrase": args["phrase"], "numPhrases": num}
     if regions := args.get("regions"):
-        body["regions"] = regions
+        # обход 06.09.2026: Вордстат ждёт регионы строками, числа отбивает 400
+        body["regions"] = [str(r) for r in regions]
     if devices := args.get("devices"):
         body["devices"] = devices
     data = await _wordstat_request(client, "/topRequests", body)
@@ -2036,7 +2611,8 @@ async def _handle_wordstat_dynamics(client, args):
         "toDate": _rfc3339(args["to_date"]),
     }
     if regions := args.get("regions"):
-        body["regions"] = regions
+        # обход 06.09.2026: Вордстат ждёт регионы строками, числа отбивает 400
+        body["regions"] = [str(r) for r in regions]
     if devices := args.get("devices"):
         body["devices"] = devices
     data = await _wordstat_request(client, "/dynamics", body)
@@ -2075,6 +2651,18 @@ _extra_config = {
     "folder_id": YC_FOLDER_ID,
     "yc_api_key": YC_API_KEY,
 }
+
+
+async def _handle_adgroups_delete(client, args):
+    ids = _as_ids(args["group_ids"])
+    data = await _api(client, "adgroups", "delete", {"SelectionCriteria": {"Ids": ids}})
+    return _result(data.get("result", data))
+
+
+async def _handle_keywords_delete(client, args):
+    ids = _as_ids(args["keyword_ids"])
+    data = await _api(client, "keywords", "delete", {"SelectionCriteria": {"Ids": ids}})
+    return _result(data.get("result", data))
 
 
 async def main():
