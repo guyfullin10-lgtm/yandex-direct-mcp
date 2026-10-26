@@ -60,13 +60,22 @@
 git clone -b fork-main https://github.com/guyfullin10-lgtm/yandex-direct-mcp.git
 cd yandex-direct-mcp
 python3 -m venv venv && venv/bin/pip install -r requirements.txt
-cp .env.example .env   # вписать YD_OAUTH_TOKEN, при агентском доступе — YD_LOGIN
+cp .env.example .env && chmod 600 .env   # вписать YD_OAUTH_TOKEN, при агентском доступе — YD_LOGIN
+```
+
+Сервер берёт настройки из переменных окружения и `.env` сам не читает. Чтобы токен не лежал
+в конфиге клиента, удобно запускать через обёртку `run.sh` в папке репозитория:
+
+```bash
+#!/bin/bash
+cd "$(dirname "$0")" && set -a && . ./.env && set +a && exec venv/bin/python server.py
 ```
 
 Подключение к Claude Code (stdio):
 
 ```bash
-claude mcp add yandex-direct -- /path/to/yandex-direct-mcp/venv/bin/python /path/to/yandex-direct-mcp/server.py
+chmod +x run.sh
+claude mcp add yandex-direct -- /path/to/yandex-direct-mcp/run.sh
 ```
 
 Рекомендую начать с `YD_CONFIRM=true`: любое изменение денег сначала придёт предпросмотром, и только
