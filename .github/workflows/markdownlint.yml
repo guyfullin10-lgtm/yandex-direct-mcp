@@ -1,0 +1,23 @@
+name: markdownlint
+
+on:
+  pull_request:
+    paths: ['AGENTS.md', 'agent_docs/**.md', '.agents/**.md', '.github/workflows/markdownlint.yml']
+  push:
+    branches: [main, master]
+    paths: ['AGENTS.md', 'agent_docs/**.md', '.agents/**.md', '.github/workflows/markdownlint.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DavidAnson/markdownlint-cli2-action@v24
+        with:
+          globs: |
+            AGENTS.md
+            agent_docs/**/*.md
+            .agents/**/*.md

@@ -8,3 +8,12 @@ __pycache__/
 dist/
 build/
 .claude/
+
+# рабочие артефакты эксплуатации (могут содержать секреты)
+.env.*
+*.bak
+*.bak.*
+sa-key.json
+.claude/*
+!.claude/skills/
+!.claude/hooks/
